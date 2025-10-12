@@ -1,12 +1,10 @@
-# .sh [mode=top|new|best|ask|show|job] [posts=30] [comments=5]
+#!/usr/bin/env bash
+# hn.sh [mode=top|new|best|ask|show|job] [posts=15] [comments=5]
 
-mode="${1:-top}"
-posts="${2:-30}"
-comments="${3:-5}"
 api="https://hacker-news.firebaseio.com/v0"
 ua="curl/hn-tui"
 
-# ----- helpers -----
+# ---------- helpers ----------
 endpoint() {
   case "$mode" in
     top)  echo "$api/topstories.json" ;;
@@ -18,9 +16,10 @@ endpoint() {
     *)    echo "$api/topstories.json" ;;
   esac
 }
+
 item() { curl -fsSL -A "$ua" "$api/item/$1.json"; }
 
-# jq filter to flatten HN HTML-ish text to plain text
+# jq filter: flatten HN HTML-ish text to plain text (and strip tabs)
 clean_html='
   ( . // "" )
   | gsub("<p>"; "\n\n")
@@ -31,11 +30,13 @@ clean_html='
   | gsub("&lt;"; "<")
   | gsub("&gt;"; ">")
   | gsub("&#x2F;"; "/")
+  | gsub("\t"; " ")
   | gsub("\\s+"; " ")
 '
 
+# ---------- rows ----------
 # TSV per row:
-# title \t by \t score \t descendants \t hn_url \t external_url \t id \t text_snippet
+# title \t by \t score \t descendants \t hn_url \t external_url \t id \t snippet
 get_posts() {
   ids=$(curl -fsSL -A "$ua" "$(endpoint)" | jq -r ".[:$posts][]")
   for id in $ids; do
@@ -54,7 +55,7 @@ get_posts() {
   done
 }
 
-# ----- rendering -----
+# ---------- rendering ----------
 post_header() { # $1..$8 = title, by, score, desc, hn_url, ext_url, id, snippet
   printf '\e[1m%s\e[0m\n' "$1"
   printf 'u:%s  %s↑  💬 %s\n' "$2" "$3" "$4"
@@ -63,64 +64,121 @@ post_header() { # $1..$8 = title, by, score, desc, hn_url, ext_url, id, snippet
   [ -n "$8" ] && printf '\n%s\n' "$8"
 }
 
-preview_block() { # TSV row -> header + top N comments (1 line each)
-  IFS=$'\t' read -r title by score desc hn_url ext_url id snippet <<<"$1"
-  post_header "$title" "$by" "$score" "$desc" "$hn_url" "$ext_url" "$id" "$snippet"
-  printf '\n\e[36mTop %s comments\e[0m\n' "$comments"
+# Build "top N" comments: over-fetch kids, filter deleted/dead/empty, sort by score.
+print_top_comments() { # $1 = story id
+  sid="$1"
+  kids=$(curl -sSLA "$ua" "$api/item/$sid.json" | jq -r '.kids? // [] | .[:200][]') || {
+    echo "  (no comments)"; return
+  }
+  [ -z "$kids" ] && { echo "  (no comments)"; return; }
 
-  # first N top-level kids
-  while read -r kid; do
-    [ -z "$kid" ] && continue
-    item "$kid" | jq -r "
-      select(. != null and .deleted!=true and .dead!=true) |
-      \"  \u001b[33m•\u001b[0m \u001b[32m\" + (.by // \"[deleted]\") + \"\u001b[0m  \" +
-      ( .text // \"[no text]\" | $clean_html )"
-  done < <(item "$id" | jq -r ".kids? // [] | .[:$comments][]")
+  # fetch each kid; failed requests emit null so jq can skip them
+  tsv=$(
+    while read -r kid; do
+      [ -n "$kid" ] && curl -sSLA "$ua" "$api/item/$kid.json" || echo null
+    done <<<"$kids" \
+    | jq -s -r --argjson n "${comments:-5}" '
+        def clean:
+          ( . // "" )
+          | gsub("<p>"; "\n\n")
+          | gsub("<[^>]+>"; "")
+          | gsub("&quot;"; "\"")
+          | gsub("&amp;"; "&")
+          | gsub("&lt;"; "<")
+          | gsub("&gt;"; ">")
+          | gsub("&#x2F;"; "/")
+          | gsub("\t"; " ")
+          | gsub("\\s+"; " ")
+        ;
+        map(select(. != null and .deleted!=true and .dead!=true
+                   and .type=="comment" and ((.text // "") | length) > 0))
+        | sort_by(-(.score // 0))
+        | .[0:$n]
+        | if length==0 then [] else
+            map([ (.by // "[deleted]"),
+                  ((.score // 0)|tostring),
+                  (.text // "" | clean) ] | @tsv)
+          end
+        | .[]
+      '
+  )
+
+  if [ -z "$tsv" ]; then
+    echo "  (no comments)"
+    return
+  fi
+
+  i=1
+  while IFS=$'\t' read -r author score body; do
+    printf '  \e[33m%u)\e[0m \e[32m%s\e[0m  (%s↑)\n' "$i" "$author" "$score"
+    printf '    %s\n\n' "$body"
+    i=$((i+1))
+  done <<<"$tsv"
 }
 
-show_post() { # TSV row -> full pager with wrapped comments
+preview_block() { # TSV row -> header + top N
+  IFS=$'\t' read -r title by score desc hn_url ext_url id snippet <<<"$1"
+  post_header "$title" "$by" "$score" "$desc" "$hn_url" "$ext_url" "$id" "$snippet"
+  printf '\n\e[36mTop %s comments\e[0m\n' "${comments:-5}"
+  print_top_comments "$id"
+}
+
+show_post() { # TSV row -> full pager
   IFS=$'\t' read -r title by score desc hn_url ext_url id snippet <<<"$1"
   {
     post_header "$title" "$by" "$score" "$desc" "$hn_url" "$ext_url" "$id" "$snippet"
-    printf '\n\e[36mTop %s comments\e[0m\n' "$comments"
-    while read -r kid; do
-      [ -z "$kid" ] && continue
-      item "$kid" | jq -r "
-        select(. != null and .deleted!=true and .dead!=true) |
-        \"\n  \u001b[33m\" + (.id|tostring) + \")\u001b[0m \u001b[32m\" + (.by // \"[deleted]\") + \"\u001b[0m\n    \" +
-        ( .text // \"[no text]\" | $clean_html )"
-    done < <(item "$id" | jq -r ".kids? // [] | .[:$comments][]")
+    printf '\n\e[36mTop %s comments\e[0m\n' "${comments:-5}"
+    print_top_comments "$id"
     echo
   } | less -R
 }
 
-open_url() { # prefer external; fallback HN link
+open_url() { # prefer external; fallback HN; with macOS fallback
   IFS=$'\t' read -r _ _ _ _ hn_url ext_url _ _ <<<"$1"
   url="${ext_url:-$hn_url}"
-  if command -v termux-open-url >/dev/null 2>&1; then termux-open-url "$url"
-  elif command -v xdg-open       >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1
+  if command -v termux-open-url >/dev/null 2>&1; then
+    termux-open-url "$url"
+  elif command -v open >/dev/null 2>&1; then
+    open "$url"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1
+  else
+    printf 'Open this URL:\n%s\n' "$url"
   fi
 }
 
-export api ua comments clean_html
-export -f item preview_block show_post open_url post_header
+# ---------- subcommand dispatch (must be BEFORE arg parsing) ----------
+if [[ "$1" == "__preview" ]]; then
+  idx="$2"; TSV="$3"; comments="${comments:-5}"
+  row=$(awk -v n="$idx" 'NR==n{print;exit}' "$TSV")
+  preview_block "$row"
+  exit
+elif [[ "$1" == "__show" ]]; then
+  idx="$2"; TSV="$3"; comments="${comments:-5}"
+  row=$(awk -v n="$idx" 'NR==n{print;exit}' "$TSV")
+  show_post "$row"
+  exit
+fi
+
+# ---------- normal arg parsing (not triggered for subcommands) ----------
+mode="${1:-top}"
+posts="${2:-15}"
+comments="${3:-5}"
 
 printf '\e[36mHN %s — showing %s stories\e[0m\n\n' "$mode" "$posts"
 
-# ----- interactive loop -----
+# ---------- interactive loop (full-title list; delimiter-free) ----------
 tsv=$(mktemp)
 trap 'rm -f "$tsv"' EXIT
 get_posts > "$tsv"
-export TSV="$tsv"
 
 while :; do
   sel=$(
-    # Feed fzf only "<idx>\t<title>"
-    awk -F'\t' '{printf "%d\t%s\n", NR, $1}' "$TSV" |
+    awk -F'\t' '{printf "%d\t%s\n", NR, $1}' "$tsv" |
     fzf --ansi --height=100% --reverse \
         --expect=enter,ctrl-o,ctrl-r \
         --prompt='Enter: comments • Ctrl-O: open • Ctrl-R: refresh • Esc: quit > ' \
-        --preview 'bash -lc '\''i=$(cut -f1 <<<"$1"); r=$(awk -v n="$i" "NR==n{print;exit}" "$TSV"); preview_block "$r"'\'' -- {} ' \
+        --preview 'bash -lc '\''i=$(cut -f1 <<<"$1"); '"$0"' __preview "$i" "'"$tsv"'"'\'' -- {} ' \
         --preview-window=down,70%,border
   ) || break
 
@@ -128,13 +186,12 @@ while :; do
   idx=$(printf '%s\n' "$sel" | sed -n '2p' | cut -f1)
   [ -z "$idx" ] && break
 
-  row=$(awk -v n="$idx" 'NR==n{print;exit}' "$TSV")
+  row=$(awk -v n="$idx" 'NR==n{print;exit}' "$tsv")
 
   case "$key" in
-    enter)  show_post "$row" ;;     # q returns to list
-    ctrl-o) open_url "$row" ;;      # prefer external, fallback HN
-    ctrl-r) get_posts > "$TSV" ;;   # refresh data and re-list
+    enter)  "$0" __show "$idx" "$tsv" ;;  # q returns to list
+    ctrl-o) open_url "$row" ;;
+    ctrl-r) get_posts > "$tsv" ;;         # refresh data
     *)      break ;;
   esac
 done
-
